@@ -17,7 +17,12 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 INTERFACE = 'p2p0'
 PORTAL = '10.0.3.2'
 CONFIG = Path('/etc/gdut-login/credentials.json')
-PING_TARGETS = [('百度', 'www.baidu.com'), ('哔哩哔哩', 'www.bilibili.com')]
+PING_TARGETS = [
+    ('百度', 'www.baidu.com'),
+    ('哔哩哔哩', 'www.bilibili.com'),
+    ('腾讯', 'www.qq.com'),
+    ('阿里云', 'www.aliyun.com'),
+]
 SERVICE = 'gdut-login.service'
 INSTALLED_SCRIPT = Path('/usr/local/sbin/gdut-login.py')
 UNIT_FILE = Path('/etc/systemd/system/gdut-login.service')
@@ -64,7 +69,7 @@ def ping_latency(label, host):
     prefix = '{} ({})：'.format(label, host)
     try:
         result = subprocess.run(
-            ['ping', '-4', '-n', '-I', INTERFACE, '-c', '3', '-W', '2', host],
+            ['ping', '-4', '-n', '-I', INTERFACE, '-c', '3', '-W', '2', '-w', '10', host],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12,
             env=dict(os.environ, LC_ALL='C'))
     except FileNotFoundError:
@@ -83,6 +88,12 @@ def ping_latency(label, host):
     if result.returncode == 1:
         return prefix + '未收到 ICMP 回应（可能丢包或对方限制 ping）。'
     return prefix + 'ping 执行异常，请检查域名解析或 ping 权限。'
+
+
+def show_ping_results():
+    for label, host in PING_TARGETS:
+        emit(ping_latency(label, host))
+    emit('ping 测试结束。')
 
 
 def load_credentials():
@@ -343,8 +354,7 @@ def show_status():
     emit('开机自动连接：' + ('已启用' if service_action('is-enabled', '--quiet') else '未启用'))
     if online():
         emit('当前连接成功（外网 HTTP 检查通过）')
-        for label, host in PING_TARGETS:
-            emit(ping_latency(label, host))
+        show_ping_results()
     else:
         emit('当前外网 HTTP 检查未通过；可能未认证，也可能是网络或探测站点异常。')
     return 0
@@ -386,8 +396,7 @@ def run_monitor(once=False):
             failures = 0
         if ok and not was_online:
             emit('连接成功（外网 HTTP 检查通过）')
-            for label, host in PING_TARGETS:
-                emit(ping_latency(label, host))
+            show_ping_results()
         elif not ok:
             if was_online:
                 emit('正在连接 gdut（重新检查网络并等待认证）')

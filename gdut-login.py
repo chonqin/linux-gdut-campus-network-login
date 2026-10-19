@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GDUT portal login for Debian 11; no third-party Python packages required."""
+"""GDUT portal login on Linux; no third-party Python packages required."""
 import argparse
 import html
 import getpass
@@ -8,13 +8,16 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-INTERFACE = 'p2p0'
+INTERFACE = None
+SOURCE_IP = None
+PING_SUPPORTED = True
 PORTAL = '10.0.3.2'
 CONFIG = Path('/etc/gdut-login/credentials.json')
 PING_TARGETS = [
@@ -26,6 +29,8 @@ PING_TARGETS = [
 SERVICE = 'gdut-login.service'
 INSTALLED_SCRIPT = Path('/usr/local/sbin/gdut-login.py')
 UNIT_FILE = Path('/etc/systemd/system/gdut-login.service')
+SYSTEMD_RUNTIME = Path('/run/systemd/system')
+PID1_COMM = Path('/proc/1/comm')
 MAX_CONNECT_ATTEMPTS = 3
 SERVICE_TEMPLATE = '''[Unit]
 Description=GDUT campus network automatic login
@@ -34,7 +39,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -u "{script}" --daemon
+ExecStart="{python}" -u "{script}" --daemon
 Restart=no
 UMask=0077
 NoNewPrivileges=yes
@@ -67,6 +72,10 @@ def emit(message):
 
 def ping_latency(label, host):
     prefix = '{} ({})：'.format(label, host)
+    if not PING_SUPPORTED:
+        return prefix + '已跳过，请安装兼容的 iputils ping 工具。'
+    if not INTERFACE:
+        return prefix + '尚未识别到可用网卡。'
     try:
         result = subprocess.run(
             ['ping', '-4', '-n', '-I', INTERFACE, '-c', '3', '-W', '2', '-w', '10', host],
@@ -94,6 +103,90 @@ def show_ping_results():
     for label, host in PING_TARGETS:
         emit(ping_latency(label, host))
     emit('ping 测试结束。')
+
+
+def select_network():
+    global INTERFACE, SOURCE_IP
+    route = subprocess.run(['ip', '-j', '-4', 'route', 'get', PORTAL],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    if route.returncode:
+        raise OSError('No route to portal')
+    rows = json.loads(route.stdout)
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        raise ValueError('Invalid route response')
+    item = rows[0]
+    interface = item.get('dev')
+    source = str(ipaddress.IPv4Address(item.get('prefsrc') or item.get('src')))
+    if not isinstance(interface, str) or not interface or interface == 'lo':
+        raise ValueError('Invalid interface')
+    result = subprocess.run(['ip', '-j', '-4', 'addr', 'show', 'dev', interface],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    if result.returncode:
+        raise OSError('Interface unavailable')
+    devices = json.loads(result.stdout)
+    if not isinstance(devices, list):
+        raise ValueError('Invalid interface response')
+    addresses = {entry['local'] for device in devices if isinstance(device, dict)
+                 for entry in device.get('addr_info', [])
+                 if isinstance(entry, dict) and entry.get('family') == 'inet'}
+    if source not in addresses:
+        raise ValueError('Source address does not belong to interface')
+    if (INTERFACE, SOURCE_IP) != (interface, source):
+        emit('已识别网卡：{}，IPv4：{}'.format(interface, source))
+    INTERFACE, SOURCE_IP = interface, source
+    return addresses
+
+
+def systemd_available():
+    try:
+        return (bool(shutil.which('systemctl')) and SYSTEMD_RUNTIME.is_dir()
+                and PID1_COMM.read_text(encoding='utf-8').strip() == 'systemd')
+    except OSError:
+        return False
+
+
+def check_environment(mode):
+    global PING_SUPPORTED
+    if not sys.platform.startswith('linux'):
+        emit('此脚本需在 Linux 板卡上运行；Windows 仅用于编辑和复制文件。')
+        return False
+    if sys.version_info < (3, 6):
+        emit('需要 Python 3.6 或更高版本。')
+        return False
+    if os.geteuid() != 0:
+        emit('请使用 sudo python3 gdut-login.py 运行，或以 root 用户运行。')
+        return False
+    if mode == 'setup':
+        return True
+    missing = [name for name in ('curl', 'ip') if not shutil.which(name)]
+    if missing:
+        emit('缺少必要命令：{}；请安装 curl 和 iproute2 后重试。'.format(', '.join(missing)))
+        return False
+    try:
+        result = subprocess.run(['ip', '-j', '-4', 'addr', 'show'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        if result.returncode or not isinstance(json.loads(result.stdout), list):
+            raise ValueError('Incompatible ip command')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        emit('当前 ip 命令不支持所需的 JSON 输出；请安装完整 iproute2，不能只用精简版 BusyBox ip。')
+        return False
+    PING_SUPPORTED = bool(shutil.which('ping'))
+    if PING_SUPPORTED:
+        try:
+            help_result = subprocess.run(['ping', '-h'], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, timeout=5,
+                                         env=dict(os.environ, LC_ALL='C'))
+            help_text = (help_result.stdout + help_result.stderr).decode('utf-8', errors='replace')
+            PING_SUPPORTED = all(flag in help_text for flag in ('-4', '-I', '-c', '-W', '-w'))
+        except (OSError, subprocess.SubprocessError):
+            PING_SUPPORTED = False
+    if not PING_SUPPORTED:
+        emit('未检测到兼容的 ping，延迟测试将跳过；可安装 iputils ping 工具，连接功能不受影响。')
+    if mode in (None, 'login', 'logout') and not systemd_available():
+        emit('当前系统未运行 systemd，暂不支持自动配置开机服务和服务管理菜单。')
+        emit('可使用 --once 单次连接，或 --daemon 在前台监控；开机自启需按当前系统另行配置。')
+        return False
+    return True
 
 
 def load_credentials():
@@ -127,6 +220,8 @@ def setup_credentials():
 
 
 def request(url):
+    if not INTERFACE:
+        select_network()
     # Send the URL over stdin so credentials do not appear in process arguments.
     config = ('url = ' + json.dumps(url, ensure_ascii=True) + '\n').encode()
     result = subprocess.run([
@@ -147,21 +242,15 @@ def online():
         status, headers, body = request('http://www.baidu.com/')
         return (status == 200 and b'<!--STATUS OK-->' in body
                 and '<title>百度一下，你就知道</title>'.encode() in body)
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
         return False
 
 
 def tick():
     try:
-        result = subprocess.run(
-            ['ip', '-j', '-4', 'addr', 'show', 'dev', INTERFACE],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        addresses = {info['local'] for device in json.loads(result.stdout)
-                     for info in device.get('addr_info', []) if info.get('family') == 'inet'}
-        if not addresses:
-            return False, 60, '等待 p2p0 获得 IPv4 地址。'
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-        return False, 60, '等待 p2p0 网络接口就绪。'
+        select_network()
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        return False, 60, '尚无可用的校园网 IPv4 路由；请检查网卡连接和地址分配。'
 
     if online():
         return True, 60, '外网 HTTP 检查通过，无需重新登录。'
@@ -180,8 +269,8 @@ def tick():
         params = parse_qs(target.query)
         user_ip = str(ipaddress.IPv4Address(params['wlanuserip'][0]))
         ac_ip = str(ipaddress.IPv4Address(params['wlanacip'][0]))
-        if user_ip not in addresses:
-            return False, 60, '认证跳转中的 IP 不属于 p2p0，等待下一次检查。'
+        if user_ip != SOURCE_IP:
+            return False, 60, '认证跳转中的 IP 与当前路由源地址不一致，未发送账号密码。'
     except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
         return False, 60, '暂时无法获取有效认证参数；等待网络恢复。'
 
@@ -244,6 +333,9 @@ def ensure_credentials():
 
 
 def install_service():
+    if not systemd_available():
+        emit('当前系统未运行 systemd，无法创建开机服务；可使用 --once 单次连接。')
+        return False
     def save(path, data, mode):
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_name = None
@@ -261,7 +353,7 @@ def install_service():
         source = Path(__file__).resolve()
         if source != INSTALLED_SCRIPT.resolve():
             save(INSTALLED_SCRIPT, source.read_bytes(), 0o755)
-        unit = SERVICE_TEMPLATE.format(script=INSTALLED_SCRIPT.as_posix())
+        unit = SERVICE_TEMPLATE.format(script=INSTALLED_SCRIPT.as_posix(), python=Path(sys.executable).as_posix())
         save(UNIT_FILE, unit.encode('utf-8'), 0o644)
         # Remember an actual serial TTY when first launched from the board terminal.
         try:
@@ -277,7 +369,7 @@ def install_service():
             raise OSError('systemd reload failed')
         return True
     except (OSError, subprocess.SubprocessError):
-        emit('无法准备开机服务，请使用 sudo 在 Debian 板卡上运行。')
+        emit('无法准备开机服务，请使用 root 权限并检查 systemd 运行状态。')
         return False
 
 
@@ -317,14 +409,8 @@ def logout():
         return 1
     emit('已停用自动连接和开机自启；正在退出校园网登录。')
     try:
-        result = subprocess.run(['ip', '-j', '-4', 'addr', 'show', 'dev', INTERFACE],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        addresses = {entry['local'] for device in json.loads(result.stdout)
-                     for entry in device.get('addr_info', []) if entry.get('family') == 'inet'}
-        if len(addresses) != 1:
-            emit('无法确定 p2p0 的唯一 IPv4 地址；自动连接已停用，注销尚未确认。')
-            return 1
-        user_ip = str(ipaddress.IPv4Address(next(iter(addresses))))
+        select_network()
+        user_ip = SOURCE_IP
         if not online() and logout_redirect(user_ip):
             emit('当前已处于未认证状态，自动连接保持停用。')
             return 0
@@ -343,15 +429,23 @@ def logout():
             if not online() and logout_redirect(user_ip):
                 emit('退出登录成功（已重新出现本机认证跳转）。账号密码已保留，自动连接已停用。')
                 return 0
-    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
         pass
     emit('自动连接已停用，但尚未确认退出登录；需要在板卡上核对注销接口和实际返回。')
     return 1
 
 
 def show_status():
-    emit('自动连接服务：' + ('运行中' if service_action('is-active', '--quiet') else '未运行'))
-    emit('开机自动连接：' + ('已启用' if service_action('is-enabled', '--quiet') else '未启用'))
+    if systemd_available():
+        emit('自动连接服务：' + ('运行中' if service_action('is-active', '--quiet') else '未运行'))
+        emit('开机自动连接：' + ('已启用' if service_action('is-enabled', '--quiet') else '未启用'))
+    else:
+        emit('当前未运行 systemd，不提供开机服务状态。')
+    try:
+        select_network()
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        emit('无法识别访问校园网的 IPv4 网卡，请先连接网络。')
+        return 1
     if online():
         emit('当前连接成功（外网 HTTP 检查通过）')
         show_ping_results()
@@ -427,6 +521,8 @@ def main():
             ('status', '查看状态与 ping 延迟')]:
         group.add_argument('--' + option, action='store_const', const=option, dest='mode', help=help_text)
     mode = parser.parse_args().mode
+    if not check_environment(mode):
+        return 1
     if mode == 'setup':
         return configure()
     if mode == 'login':
